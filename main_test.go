@@ -11,7 +11,7 @@ func TestDetectTransitions_NoAlertBefore3Failures(t *testing.T) {
 		{Service: Service{Name: "api"}, Up: false, Error: "http_503"},
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		transitions := detectTransitions(results, states)
 		if len(transitions) != 0 {
 			t.Errorf("cycle %d: expected 0 transitions, got %d", i+1, len(transitions))
@@ -27,7 +27,7 @@ func TestDetectTransitions_AlertAfter3Failures(t *testing.T) {
 	}
 
 	var transitions []Transition
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		transitions = detectTransitions(results, states)
 	}
 
@@ -55,7 +55,7 @@ func TestDetectTransitions_NoDoubleAlert(t *testing.T) {
 		{Service: Service{Name: "api"}, Up: false, Error: "http_503"},
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		detectTransitions(results, states)
 	}
 
@@ -72,7 +72,7 @@ func TestDetectTransitions_RecoveryAlert(t *testing.T) {
 		{Service: Service{Name: "api"}, Up: false, Error: "http_503"},
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		detectTransitions(downResults, states)
 	}
 
@@ -123,7 +123,7 @@ func TestDetectTransitions_MultipleServices(t *testing.T) {
 	}
 
 	var transitions []Transition
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		transitions = detectTransitions(results, states)
 	}
 

@@ -44,7 +44,7 @@ type Transition struct {
     Error       string
 }
 
-const failThreshold = 3
+const failThreshold = 4
 
 func formatDuration(d time.Duration) string {
     if d < time.Minute {
