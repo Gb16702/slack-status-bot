@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -14,7 +17,8 @@ import (
 
 type Service struct {
 	Name string `json:"name"`
-	URL string `json:"url"`
+	URL  string `json:"url"`
+	Env  string `json:"env"`
 }
 
 type Config struct {
@@ -42,6 +46,13 @@ type Transition struct {
     ServiceName string
     Type        string
     Error       string
+    Downtime    string
+}
+
+type LastIncident struct {
+    ServiceName string
+    OccurredAt  time.Time
+    Duration    string
 }
 
 const failThreshold = 4
@@ -133,14 +144,24 @@ func checkService(ctx context.Context, client *http.Client, svc Service) CheckRe
     return result
 }
 
-func overallEmoji(results []CheckResult) string {
-    for _, r := range results {
-        if !r.Up {
-            return "🔴"
-        }
-    }
+func checkAll(ctx context.Context, client *http.Client, services []Service, concurrency int) []CheckResult {
+	results := make([]CheckResult, len(services))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-    return "🟢"
+	for i, svc := range services {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(i int, svc Service) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = checkService(ctx, client, svc)
+		}(i, svc)
+	}
+
+	wg.Wait()
+	return results
 }
 
 func countStatus(results []CheckResult) (healthy int, down int) {
@@ -205,31 +226,42 @@ func postThreadAlert(api *slack.Client, channelID string, tsPath string, message
     return err
 }
 
+func serviceKey(svc Service) string {
+    return svc.Name + ":" + svc.Env
+}
+
 func detectTransitions(results []CheckResult, states map[string]*ServiceState) []Transition {
     var transitions []Transition
 
     for _, r := range results {
-        name := r.Service.Name
-        state, exists := states[name]
+        key := serviceKey(r.Service)
+        displayName := fmt.Sprintf("%s (%s)", r.Service.Name, r.Service.Env)
+        state, exists := states[key]
         if !exists {
             state = &ServiceState{}
-            states[name] = state
+            states[key] = state
         }
 
         if r.Up {
             if state.IsDown {
+                downtime := ""
+                if !state.DownSince.IsZero() {
+                    downtime = formatDuration(time.Since(state.DownSince))
+                }
                 transitions = append(transitions, Transition{
-                    ServiceName: name,
+                    ServiceName: displayName,
                     Type:        "up",
+                    Downtime:    downtime,
                 })
                 state.IsDown = false
+                state.DownSince = time.Time{}
             }
             state.FailCount = 0
         } else {
             state.FailCount++
             if !state.IsDown && state.FailCount >= failThreshold {
                 transitions = append(transitions, Transition{
-                    ServiceName: name,
+                    ServiceName: displayName,
                     Type:        "down",
                     Error:       r.Error,
                 })
@@ -243,21 +275,55 @@ func detectTransitions(results []CheckResult, states map[string]*ServiceState) [
 }
 
 func sendAlerts(api *slack.Client, channelID string, tsPath string, transitions []Transition) {
-    for _, t := range transitions {
-        var msg string
-        if t.Type == "down" {
-            msg = fmt.Sprintf("🔴 *%s* is DOWN: `%s` <!here>", t.ServiceName, t.Error)
-        } else {
-            msg = fmt.Sprintf("🟢 *%s* is back UP", t.ServiceName)
-        }
+    var downLines, upLines []string
 
+    for _, t := range transitions {
+        if t.Type == "down" {
+            downLines = append(downLines, fmt.Sprintf("• *%s*: `%s`", t.ServiceName, t.Error))
+        } else {
+            if t.Downtime != "" {
+                upLines = append(upLines, fmt.Sprintf("• *%s* (was down %s)", t.ServiceName, t.Downtime))
+            } else {
+                upLines = append(upLines, fmt.Sprintf("• *%s*", t.ServiceName))
+            }
+        }
+    }
+
+    if len(downLines) > 0 {
+        msg := "🔴 *Services DOWN* <!here>\n" + strings.Join(downLines, "\n")
+        if err := postThreadAlert(api, channelID, tsPath, msg); err != nil {
+            fmt.Fprintf(os.Stderr, "failed to post alert: %v\n", err)
+        }
+    }
+
+    if len(upLines) > 0 {
+        msg := "🟢 *Services back UP*\n" + strings.Join(upLines, "\n")
         if err := postThreadAlert(api, channelID, tsPath, msg); err != nil {
             fmt.Fprintf(os.Stderr, "failed to post alert: %v\n", err)
         }
     }
 }
 
-func renderBoard(results []CheckResult, states map[string]*ServiceState) []slack.Block {
+func renderServiceLine(r CheckResult, states map[string]*ServiceState) string {
+    var emoji, statusText string
+    if r.Up {
+        emoji = "🟢"
+        statusText = fmt.Sprintf("`%dms`", r.Latency.Milliseconds())
+    } else {
+        emoji = "🔴"
+        key := serviceKey(r.Service)
+        state := states[key]
+        if state != nil && !state.DownSince.IsZero() {
+            downtime := formatDuration(time.Since(state.DownSince))
+            statusText = fmt.Sprintf("`%s (%s)`", r.Error, downtime)
+        } else {
+            statusText = fmt.Sprintf("`%s`", r.Error)
+        }
+    }
+    return fmt.Sprintf("%s  *%s:* %s", emoji, r.Service.Name, statusText)
+}
+
+func renderBoard(results []CheckResult, states map[string]*ServiceState, lastIncident *LastIncident) []slack.Block {
     var blocks []slack.Block
 
     updateText := fmt.Sprintf("Updated: %s", time.Now().Format("2006-01-02 15:04:05"))
@@ -265,35 +331,44 @@ func renderBoard(results []CheckResult, states map[string]*ServiceState) []slack
         slack.NewTextBlockObject(slack.MarkdownType, updateText, false, false),
     ))
 
+    blocks = append(blocks, slack.NewContextBlock("",
+        slack.NewTextBlockObject(slack.MarkdownType, "*Development*", false, false),
+    ))
+    for _, r := range results {
+        if r.Service.Env == "development" {
+            text := renderServiceLine(r, states)
+            blocks = append(blocks, slack.NewSectionBlock(
+                slack.NewTextBlockObject(slack.MarkdownType, text, false, false),
+                nil, nil,
+            ))
+        }
+    }
+
     blocks = append(blocks, slack.NewDividerBlock())
 
+    blocks = append(blocks, slack.NewContextBlock("",
+        slack.NewTextBlockObject(slack.MarkdownType, "*Production*", false, false),
+    ))
     for _, r := range results {
-        var emoji, statusText string
-        if r.Up {
-            emoji = "🟢"
-            statusText = fmt.Sprintf("`%dms`", r.Latency.Milliseconds())
-        } else {
-            emoji = "🔴"
-            state := states[r.Service.Name]
-            if state != nil && !state.DownSince.IsZero() {
-                downtime := formatDuration(time.Since(state.DownSince))
-                statusText = fmt.Sprintf("`%s (%s)`", r.Error, downtime)
-            } else {
-                statusText = fmt.Sprintf("`%s`", r.Error)
-            }
+        if r.Service.Env == "production" {
+            text := renderServiceLine(r, states)
+            blocks = append(blocks, slack.NewSectionBlock(
+                slack.NewTextBlockObject(slack.MarkdownType, text, false, false),
+                nil, nil,
+            ))
         }
-
-        text := fmt.Sprintf("%s  *%s:* %s", emoji, r.Service.Name, statusText)
-        blocks = append(blocks, slack.NewSectionBlock(
-            slack.NewTextBlockObject(slack.MarkdownType, text, false, false),
-            nil, nil,
-        ))
     }
 
     blocks = append(blocks, slack.NewDividerBlock())
 
     healthy, down := countStatus(results)
     footerText := fmt.Sprintf("%d healthy  •  %d down", healthy, down)
+
+    lastIncidentText := renderLastIncident(lastIncident)
+    if lastIncidentText != "" {
+        footerText += "\n" + lastIncidentText
+    }
+
     blocks = append(blocks, slack.NewContextBlock("",
         slack.NewTextBlockObject(slack.MarkdownType, footerText, false, false),
     ))
@@ -301,17 +376,31 @@ func renderBoard(results []CheckResult, states map[string]*ServiceState) []slack
     return blocks
 }
 
-func runCycle(ctx context.Context, api *slack.Client, client *http.Client, cfg Config, channelID string, states map[string]*ServiceState) error {
-	var results []CheckResult
-	for _, svc := range cfg.Services {
-		result := checkService(ctx, client, svc)
-		results = append(results, result)
-		fmt.Printf("%s: up=%v, latency=%v\n", result.Service.Name, result.Up, result.Latency)
+func renderLastIncident(incident *LastIncident) string {
+    if incident == nil || incident.OccurredAt.IsZero() {
+        return ""
+    }
+    ago := formatDuration(time.Since(incident.OccurredAt))
+    return fmt.Sprintf("Last incident: %s, %s ago (down %s)", incident.ServiceName, ago, incident.Duration)
+}
+
+func runCycle(ctx context.Context, api *slack.Client, client *http.Client, cfg Config, channelID string, states map[string]*ServiceState, lastIncident *LastIncident) error {
+	results := checkAll(ctx, client, cfg.Services, cfg.Concurrency)
+	for _, r := range results {
+		fmt.Printf("%s: up=%v, latency=%v\n", r.Service.Name, r.Up, r.Latency)
 	}
 
 	transitions := detectTransitions(results, states)
 
-	blocks := renderBoard(results, states)
+	for _, t := range transitions {
+		if t.Type == "up" && t.Downtime != "" {
+			lastIncident.ServiceName = t.ServiceName
+			lastIncident.OccurredAt = time.Now()
+			lastIncident.Duration = t.Downtime
+		}
+	}
+
+	blocks := renderBoard(results, states, lastIncident)
 
 	if err := upsertBoard(api, channelID, ".board_ts", blocks); err != nil {
 		return fmt.Errorf("upsert board: %w", err)
@@ -342,24 +431,40 @@ func run() error {
 	fmt.Printf("Loaded %d services, checking every %ds\n", len(cfg.Services), cfg.IntervalSeconds)
 
 	api := slack.New(token)
-	client := &http.Client{Timeout: time.Duration(cfg.TimeoutMs) * time.Millisecond}
-	states := make(map[string]*ServiceState)
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: cfg.Concurrency,
+		IdleConnTimeout:     90 * time.Second,
+	}
 
-	ctx := context.Background()
-	if err := runCycle(ctx, api, client, cfg, channelID, states); err != nil {
+	client := &http.Client{
+		Timeout:   time.Duration(cfg.TimeoutMs) * time.Millisecond,
+		Transport: transport,
+	}
+	states := make(map[string]*ServiceState)
+	lastIncident := &LastIncident{}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runCycle(ctx, api, client, cfg, channelID, states, lastIncident); err != nil {
 		fmt.Fprintf(os.Stderr, "cycle error: %v\n", err)
 	}
 
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if err := runCycle(ctx, api, client, cfg, channelID, states); err != nil {
-			fmt.Fprintf(os.Stderr, "cycle error: %v\n", err)
+	for {
+		select {
+		case <-ticker.C:
+			if err := runCycle(ctx, api, client, cfg, channelID, states, lastIncident); err != nil {
+				fmt.Fprintf(os.Stderr, "cycle error: %v\n", err)
+			}
+		case <-ctx.Done():
+			fmt.Println("Shutting down...")
+			return nil
 		}
 	}
-
-	return nil
 }
 
 func main() {
